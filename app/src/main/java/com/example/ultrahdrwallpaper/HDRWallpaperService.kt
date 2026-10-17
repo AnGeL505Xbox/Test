@@ -3,6 +3,7 @@ package com.example.ultrahdrwallpaper
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.ColorSpace
 import android.graphics.ImageDecoder
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
@@ -23,7 +24,7 @@ import java.nio.FloatBuffer
 import kotlin.math.ln
 import kotlin.math.max
 
-/** Experimental FP16/scRGB wallpaper. The OEM compositor can still constrain the output to SDR. */
+/** Experimental HDR10/PQ wallpaper. One UI may still composite a wallpaper in SDR. */
 class HDRWallpaperService : WallpaperService() {
     override fun onCreateEngine(): Engine = WallpaperEngine()
 
@@ -34,8 +35,8 @@ class HDRWallpaperService : WallpaperService() {
 
         override fun onCreate(holder: SurfaceHolder) {
             super.onCreate(holder)
-            // Request a floating-point buffer rather than the usual 8-bit SDR wallpaper buffer.
-            holder.setFormat(PixelFormat.RGBA_F16)
+            // Request a 10-bit buffer; this does not force the launcher to display HDR.
+            holder.setFormat(PixelFormat.RGBA_1010102)
         }
 
         override fun onSurfaceCreated(holder: SurfaceHolder) {
@@ -75,11 +76,12 @@ class HDRWallpaperService : WallpaperService() {
                     val hdrRatio = if (display?.isHdrSdrRatioAvailable == true)
                         max(2.5f, display.hdrSdrRatio) else 2.5f
                     renderer = GainmapRenderer(surfaceHolder, bitmap, hdrRatio).also {
-                        it.draw()
+                        val eglResult = it.draw()
+                        report("HDR10/PQ: $eglResult. " +
+                            "Ganancia solicitada=${"%.2f".format(hdrRatio)}x; " +
+                            "referencia SDR=203 nits. " +
+                            "EGL aceptado NO confirma brillo HDR en One UI.")
                     }
-                    report("FP16 + EGL scRGB lineal: fotograma enviado. " +
-                        "HDR/SDR solicitado=${"%.2f".format(hdrRatio)}x. " +
-                        "Esto NO demuestra que One UI lo muestre en HDR.")
                 } finally {
                     bitmap.recycle()
                 }
@@ -107,7 +109,7 @@ class HDRWallpaperService : WallpaperService() {
     }
 }
 
-/** Only works when FP16 EGL window surfaces with scRGB linear are supported. No misleading SDR fallback. */
+/** Requires an EGL BT.2020/PQ 10-bit window surface. No silent SDR fallback. */
 private class GainmapRenderer(
     private val holder: SurfaceHolder,
     private val image: Bitmap,
@@ -121,10 +123,11 @@ private class GainmapRenderer(
     private var program = 0
 
     companion object {
-        private const val EGL_COLOR_COMPONENT_TYPE_EXT = 0x3339
-        private const val EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT = 0x333B
         private const val EGL_GL_COLORSPACE_KHR = 0x309D
-        private const val EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT = 0x3350
+        private const val EGL_GL_COLORSPACE_BT2020_PQ_EXT = 0x3340
+        // Assumption for PQ transfer: Android commonly uses ~203 nit SDR diffuse white.
+        // This is a test reference, NOT the device's measured SDR white luminance.
+        private const val SDR_WHITE_NITS = 203.0f
         private val VERTEX = """
             attribute vec2 aPos;
             varying vec2 vUV;
@@ -145,6 +148,8 @@ private class GainmapRenderer(
             uniform vec3 uEpsSdr;
             uniform vec3 uEpsHdr;
             uniform float uWeight;
+            uniform float uSdrWhiteNits;
+            uniform mat3 uTo2020;
 
             vec3 srgbToLinear(vec3 c) {
                 vec3 low = c / 12.92;
@@ -159,15 +164,20 @@ private class GainmapRenderer(
                     pow(gm, uGamma));
                 vec3 reconstructed = max(vec3(0.0),
                     (base + uEpsSdr) * exp(logGain * uWeight) - uEpsHdr);
-                // scRGB-linear FP16: values above 1.0 must survive to the compositor.
-                gl_FragColor = vec4(reconstructed, 1.0);
+                // Base primaries -> linear BT.2020; encode *absolute* PQ ST 2084.
+                vec3 bt2020 = max(vec3(0.0), uTo2020 * reconstructed);
+                vec3 n = clamp(bt2020 * (uSdrWhiteNits / 10000.0), 0.0, 1.0);
+                vec3 p = pow(n, vec3(0.1593017578125));
+                vec3 pq = pow((vec3(0.8359375) + 18.8515625 * p) /
+                              (vec3(1.0) + 18.6875 * p), vec3(78.84375));
+                gl_FragColor = vec4(pq, 1.0);
             }
         """.trimIndent()
     }
 
-    fun draw() {
+    fun draw(): String {
         try {
-            setupEgl()
+            val eglSummary = setupEgl()
             program = linkProgram(VERTEX, FRAGMENT)
             GLES20.glUseProgram(program)
             baseTexture = loadTexture(image)
@@ -189,6 +199,25 @@ private class GainmapRenderer(
             val w = (ln(max(headroom, lower).toDouble() / lower) /
                 ln(upper.toDouble() / lower)).toFloat().coerceIn(0f, 1f)
             GLES20.glUniform1f(uniform("uWeight"), w)
+            GLES20.glUniform1f(uniform("uSdrWhiteNits"), SDR_WHITE_NITS)
+            // Gainmap math is defined in the primaries of the base bitmap.
+            // These matrices are column-major (OpenGL); RGB values remain linear.
+            val srcColorSpace = image.colorSpace
+            val isP3 = srcColorSpace == ColorSpace.get(ColorSpace.Named.DISPLAY_P3)
+            val isSrgb = srcColorSpace == ColorSpace.get(ColorSpace.Named.SRGB)
+            check(isP3 || isSrgb) {
+                "Espacio de color no admitido para reconstruccion: ${srcColorSpace?.name}"
+            }
+            val to2020 = if (isP3) floatArrayOf(
+                0.753833f, 0.045744f, -0.001210f,
+                0.198597f, 0.941777f, 0.017602f,
+                0.047570f, 0.012479f, 0.983609f
+            ) else floatArrayOf(
+                0.627404f, 0.069097f, 0.016391f,
+                0.329283f, 0.919540f, 0.088013f,
+                0.043313f, 0.011362f, 0.895595f
+            )
+            GLES20.glUniformMatrix3fv(uniform("uTo2020"), 1, false, to2020, 0)
             val screenW = max(1, holder.surfaceFrame.width())
             val screenH = max(1, holder.surfaceFrame.height())
             val imageAspect = image.width.toFloat() / image.height
@@ -210,43 +239,56 @@ private class GainmapRenderer(
             GLES20.glDisableVertexAttribArray(position)
             check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "OpenGL error" }
             check(EGL14.eglSwapBuffers(display, surface)) { "eglSwapBuffers fallo" }
+            return "$eglSummary, color=${image.colorSpace?.name ?: "desconocido"}, frame enviado"
         } catch (t: Throwable) {
             release()
             throw t
         }
     }
 
-    private fun setupEgl() {
+    private fun setupEgl(): String {
         display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
         check(display != EGL14.EGL_NO_DISPLAY) { "EGL sin display" }
         check(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 0)) { "eglInitialize fallo" }
         val extensions = EGL14.eglQueryString(display, EGL14.EGL_EXTENSIONS).orEmpty()
-        check(extensions.contains("EGL_EXT_pixel_format_float") ||
-              extensions.contains("EGL_KHR_pixel_format_float")) { "Sin soporte EGL FP16" }
-        check(extensions.contains("EGL_EXT_gl_colorspace_scrgb_linear")) {
-            "Sin soporte EGL scRGB lineal" }
+        check(extensions.split(' ').contains("EGL_EXT_gl_colorspace_bt2020_pq")) {
+            "Sin soporte EGL_EXT_gl_colorspace_bt2020_pq" }
         val configs = arrayOfNulls<EGLConfig>(1)
         val counts = IntArray(1)
         val attributes = intArrayOf(
             EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-            EGL14.EGL_RED_SIZE, 16, EGL14.EGL_GREEN_SIZE, 16,
-            EGL14.EGL_BLUE_SIZE, 16, EGL14.EGL_ALPHA_SIZE, 16,
-            EGL_COLOR_COMPONENT_TYPE_EXT, EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT,
+            EGL14.EGL_RED_SIZE, 10, EGL14.EGL_GREEN_SIZE, 10,
+            EGL14.EGL_BLUE_SIZE, 10, EGL14.EGL_ALPHA_SIZE, 2,
             EGL14.EGL_NONE
         )
         check(EGL14.eglChooseConfig(display, attributes, 0, configs, 0, 1, counts, 0) &&
-              counts[0] > 0 && configs[0] != null) { "No hay EGLConfig FP16" }
+              counts[0] > 0 && configs[0] != null) { "No hay EGLConfig RGB10_A2" }
         val config = configs[0]!!
         context = EGL14.eglCreateContext(display, config, EGL14.EGL_NO_CONTEXT,
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0)
         check(context != EGL14.EGL_NO_CONTEXT) { "Sin contexto OpenGL ES 2" }
         surface = EGL14.eglCreateWindowSurface(display, config, holder,
-            intArrayOf(EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT,
+            intArrayOf(EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_BT2020_PQ_EXT,
                 EGL14.EGL_NONE), 0)
-        check(surface != EGL14.EGL_NO_SURFACE) { "One UI no acepto superficie HDR FP16 scRGB" }
+        check(surface != EGL14.EGL_NO_SURFACE) {
+            "No se pudo crear superficie EGL BT.2020/PQ (error ${EGL14.eglGetError()})" }
+        val colorspace = IntArray(1)
+        check(EGL14.eglQuerySurface(display, surface, EGL_GL_COLORSPACE_KHR, colorspace, 0)) {
+            "No se pudo consultar EGL colorspace" }
+        check(colorspace[0] == EGL_GL_COLORSPACE_BT2020_PQ_EXT) {
+            "EGL no confirmo BT.2020/PQ (valor=${colorspace[0]})" }
         check(EGL14.eglMakeCurrent(display, surface, surface, context)) {
             "eglMakeCurrent fallo" }
+        val red = IntArray(1)
+        val green = IntArray(1)
+        val blue = IntArray(1)
+        EGL14.eglGetConfigAttrib(display, config, EGL14.EGL_RED_SIZE, red, 0)
+        EGL14.eglGetConfigAttrib(display, config, EGL14.EGL_GREEN_SIZE, green, 0)
+        EGL14.eglGetConfigAttrib(display, config, EGL14.EGL_BLUE_SIZE, blue, 0)
+        check(red[0] >= 10 && green[0] >= 10 && blue[0] >= 10) {
+            "EGL no asigno configuracion de 10 bits" }
+        return "EGL BT.2020/PQ verificado, RGB=${red[0]}/${green[0]}/${blue[0]} bits"
     }
 
     private fun compile(type: Int, source: String): Int {

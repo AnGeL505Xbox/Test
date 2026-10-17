@@ -37,7 +37,7 @@ class MainActivity : Activity() {
         }
         status = TextView(this).apply {
             textSize = 16f
-            text = "Ultra HDR Wallpaper 0.2 — prueba experimental FP16/scRGB. Selecciona un JPEG Ultra HDR."
+            text = "Ultra HDR Wallpaper 0.3 — prueba experimental HDR10/PQ de 10 bits. Selecciona un JPEG Ultra HDR."
         }
         diagnostic = TextView(this).apply { textSize = 13f }
         preview = ImageView(this).apply {
@@ -97,7 +97,7 @@ class MainActivity : Activity() {
         diagnostic.text = "Pantalla HDR: ${display?.isHdr == true}. " +
             "HDR/SDR actual: $ratio.\nResultado del fondo: $msg\n" +
             "La vista inferior usa COLOR_MODE_HDR (solo esta Activity). " +
-            "Que esa vista sea HDR NO demuestra que el wallpaper lo sea."
+            "Aunque EGL confirme BT.2020/PQ, One UI puede seguir mostrando el fondo en SDR."
     }
 
     private fun refreshPreview() {
